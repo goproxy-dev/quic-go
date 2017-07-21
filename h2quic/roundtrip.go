@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	quic "github.com/phuslu/quic-go"
 
@@ -34,6 +35,12 @@ type RoundTripper struct {
 	// uncompressed.
 	DisableCompression bool
 
+	// ResponseHeaderTimeout, if non-zero, specifies the amount of
+	// time to wait for a server's response headers after fully
+	// writing the request (including its body, if any). This
+	// time does not include the time to read the response body.
+	ResponseHeaderTimeout time.Duration
+
 	// TLSClientConfig specifies the TLS configuration to use with
 	// tls.Client. If nil, the default configuration is used.
 	TLSClientConfig *tls.Config
@@ -49,6 +56,13 @@ type RoundTripper struct {
 	// connections for requests.
 	// If Dial is nil, quic.DialAddr will be used.
 	Dial func(network, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.Session, error)
+
+	// KeepAliveTimeout is specifies an optional duration for quic.Session life time.
+	// If this value is zero, it will never close
+	KeepAliveTimeout time.Duration
+
+	// IdleConnTimeout is specifies an optional duration for quic.Session idle time.
+	IdleConnTimeout time.Duration
 
 	clients map[string]roundTripCloser
 }
@@ -131,21 +145,30 @@ func (r *RoundTripper) getClient(hostname string, onlyCached bool) (http.RoundTr
 		hostnameKey = hostname
 	}
 
-	client, ok := r.clients[hostnameKey]
+	c, ok := r.clients[hostnameKey]
+	if ok && r.KeepAliveTimeout != 0 && time.Since(c.(*client).createdAt) > r.KeepAliveTimeout {
+		ok = false
+	}
+	if ok && r.IdleConnTimeout != 0 && time.Since(c.(*client).accessAt) > r.IdleConnTimeout {
+		ok = false
+	}
 	if !ok {
 		if onlyCached {
 			return nil, ErrNoCachedConn
 		}
-		client = newClient(
+		c = newClient(
 			hostname,
 			r.TLSClientConfig,
-			&roundTripperOpts{DisableCompression: r.DisableCompression},
+			&roundTripperOpts{
+				DisableCompression: r.DisableCompression,
+				ResponseHeaderTimeout: r.ResponseHeaderTimeout,
+			},
 			r.QuicConfig,
 			r.Dial,
 		)
-		r.clients[hostname] = client
+		r.clients[hostname] = c
 	}
-	return client, nil
+	return c, nil
 }
 
 // Close closes the QUIC connections that this RoundTripper has used
